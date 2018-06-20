@@ -1,0 +1,194 @@
+#!/bin/bash
+
+. etc/bpsomatic.config
+. functions.sh
+
+input=''
+directory=''
+remove='false'
+single='false'
+twoways='false'
+panel_of_normals=''
+
+while getopts 'i:d:rstp' flag; do
+  case "${flag}" in
+    i) input="${OPTARG}" ;;
+    d) directory="${OPTARG}" ;;
+    r) remove='true' ;;
+    s) single='true' ;;
+    t) twoways='true' ;;
+    p) panel_of_normals="${OPTARG}" ;;
+  esac
+done
+
+echo "Current gatk version is"$GATK
+echo "Outputting files in directory:"$directory
+echo "Single sample calling value is "$single
+
+if [ -z $input ]
+then
+  echo "Please provide a value for input argument (-i)."
+  echo "No value provided. Exiting..."
+  exit 2
+elif [ -z $directory ]
+then 
+  echo "Please provide a value for output directory argument (-d)."
+  echo "No value provided. Exiting..."
+  exit 2
+fi
+
+while read line; do
+
+  # Input file has to be a tab-separated file, where for each line there is tumor and normal bam-file paths
+  # separated by a tab.
+
+  tumor=$(echo "$line" | cut -f1 )  
+  normal=$(echo "$line" | cut -f2)
+
+  # Sample names are extrated from the bam-files and used for output-filenames using samtools
+
+  tumorname="$($SAMTOOLS view -H $tumor | grep '^@RG' | sed "s/.*SM:\([^\t]*\).*/\1/g" | uniq)"
+  normalname="$($SAMTOOLS view -H $normal | grep '^@RG' | sed "s/.*SM:\([^\t]*\).*/\1/g" | uniq)"
+
+  # Check if directory for contamination files already exists
+  if [ check_directory("$directory$cont_dir") == 1 ]
+  then
+    echo "Created directory "$directory"contamination/ for contamination files"
+  fi
+
+  echo "Calculating contamination value for tumor sample."
+  echo "Creating pileup summaries..."
+  $GATK GetPileupSummaries \
+  --input $tumor \
+  --variant $GNOMAD \
+  --output $directory$cont_dir$tumorname$pt \
+  --intervals $INTERVALS
+  echo "Done."
+
+  echo "Starting to calculate sample contamination from sample: "$tumorname
+  $GATK CalculateContamination \
+  --input $directory$cont_dir$tumorname$pt \
+  --output $directory$cont_dir$tumorname$ct
+  echo "Done."
+
+  fraction=$(awk '{print $2}' $directory$cont_dir$tumorname$ct | head -2 | tail -1)
+  echo "Contamination fraction for sample " $tumorname " is " $fraction
+
+# Check if mutect-directory exists
+  if [ check_directory("$directory$mutect_dir") == 1 ]
+  then
+    echo "Created directory "$directory$mutect_dir" for Mutect2 output files"
+  fi
+
+  echo "Starting variant calling with Mutect2"
+  if [ -f $panel_of_normals ]
+  then
+    $GATK Mutect2 \
+    -R $REFERENCE_GENOME \
+    -I $tumor \
+    -tumor $tumorname \
+    -I $normal \
+    -normal $normalname \
+    -L $INTERVALS \
+    -O "$directory$mutect_dir$tumorname$mutect$vcf" \
+    -A StrandBiasBySample \
+    --contamination-fraction-to-filter $fraction \
+    --panel-of-normals $panel_of_normals
+  else
+    $GATK Mutect2 \
+    -R $REFERENCE_GENOME \
+    -I $tumor \
+    -tumor $tumorname \
+    -I $normal \
+    -normal $normalname \
+    -L $INTERVALS \
+    -O "$directory$mutect_dir$tumorname$mutect$vcf" \
+    -A StrandBiasBySample \
+    --contamination-fraction-to-filter $fraction
+  fi
+
+# Add single-sample calling here later
+
+# Check if filtered-directory exists
+
+# Filter Mutect2 calls
+  $GATK FilterMutectCalls \
+  -V "$directory$mutect_dir$tumorname$mutect$vcf" \
+  -contamination $fraction \
+  -O "$directory$mutect_dir$tumorname$mutect$filt$vcf"
+
+# Check if directory for filtered calls exist
+  if [ check_directory("$directory$mutect_dir$filt_dir") == 1 ]
+  then
+    echo "Created directory "$directory$mutect_dir$filt_dir" for filtered 
+    Mutect2 output files, which only have PASS variants"
+  fi
+
+# Make a separate file in folder /filtered with only PASS variants
+# using python script Filter.py
+
+# If user has specified own python interpreter in the config file,
+# use it instead of system default. The scripts are written in python3
+# so the interpreter should be a python3 interpreter
+
+  if [ -n $PYTHON3 ]
+  then
+    $PYTHON3 python/Filter.py -i "$directory$mutect_dir$tumorname$mutect$filt$vcf" -o "$directory$mutect_dir$filt_dir$tumorname$mutect$pass$vcf"
+    $PYTHON3 python/Fisher.py -i "$directory$mutect_dir$filt_dir$tumorname$mutect$pass$vcf" -o "$directory$mutect_dir$filt_dir$tumorname$mutect$pass$fisher$vcf"
+    $PYTHON3 python/Filterbydepth.py -i "$directory$mutect_dir$filt_dir$tumorname$mutect$pass$fisher$vcf" -o "$directory$mutect_dir$filt_dir$tumorname$mutect$filt$vcf"
+    rm "$directory$mutect_dir$filt_dir$tumorname$mutect$pass$fisher$vcf"
+  else
+    python python/Filter.py -i "$directory$mutect_dir$tumorname$mutect$filt$vcf" -o "$directory$mutect_dir$filt_dir$tumorname$mutect$pass$vcf"
+    python python/Fisher.py -i "$directory$mutect_dir$filt_dir$tumorname$mutect$pass$vcf" -o "$directory$mutect_dir$filt_dir$tumorname$mutect$pass$fisher$vcf"
+    python python/Filterbydepth.py -i "$directory$mutect_dir$filt_dir$tumorname$mutect$pass$fisher$vcf" -o "$directory$mutect_dir$filt_dir$tumorname$mutect$filt$vcf"
+    rm "$directory$mutect_dir$filt_dir$tumorname$mutect$pass$fisher$vcf"
+  fi
+  
+  # Fix vcf for annovar input?
+  # Check if annovar-directory exists
+  if [ check_directory("$directory$annovar_dir") == 1 ]
+  then
+    echo "Created directory "$directory$annovar_dir" for annovar output files"
+  fi
+
+  perl $ANNOVAR/table_annovar.pl "$directory$mutect_dir$filt_dir$tumorname$mutect$filt$vcf" \
+  $ANNOVAR/humandb/ -buildver hg38 \
+  -out "$directory$annovar_dir$tumorname" \
+  -protocol refGene,exac03,cosmic70 \
+  -operation g,f,f \
+  -nastring . \
+  -polish -vcfinput
+
+# Check if annotated-directory exists
+  if [ check_directory("$directory$mutect_dir$annot_dir") == 1 ]
+  then
+    echo "Created directory "$directory$mutect_dir$annot_dir" for annotated vcfs"
+  fi
+
+# Move the annovar-output vcf to annotated-folder
+  mv $directory$annovar_dir$tumorname$anno_out $directory$mutect_dir$annot_dir$tumorname$mutect$annot$vcf
+
+  $HTSLIB/bgzip $directory$mutect_dir$annot_dir$tumorname$mutect$annot$vcf
+  $HTSLIB/tabix $directory$mutect_dir$annot_dir$tumorname$mutect$annot$vcf$gz
+
+# Check if functional-directory exists
+  if [ check_directory("$directory$mutect_dir$func_dir") == 1 ]
+  then
+    echo "Created directory "$directory$mutect_dir$func_dir" for functional variant files. These are the final output files"
+  fi
+
+  $BCFTOOLS -filter -i'INFO/Func.refGene="exonic" && INFO/ExonicFunc.refGene!="synonymous_SNV"'  \
+  -o $directory$mutect_dir$func_dir$tumorname$mutect$func$vcf \
+  $directory$mutect_dir$annot_dir$tumorname$mutect$annot$vcf$gz
+
+# If -r flag (which is remove) is set to true, the pipeline erases all temporary files
+if [ "$remove" = true ]
+then
+  rm -f $directory$annovar_dir* $directory$cont_dir* $directory$mutect_dir$filt_dir*
+fi
+
+# What to do with two-directional calling? Pasting the mutect2 commands here
+# with different parameters isn't the best idea. Should there be a function in functions.sh
+
+
+done <$input
